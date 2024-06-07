@@ -1,0 +1,143 @@
+diff -rbEu llama.cpp.ref/examples/server/server.cpp llama.cpp/examples/server/server.cpp
+--- llama.cpp.ref/examples/server/server.cpp	2024-06-06 16:13:28.053073330 -0400
++++ llama.cpp/examples/server/server.cpp	2024-06-06 16:41:07.800977729 -0400
+@@ -168,6 +168,10 @@
+     std::vector<llama_token> cache_tokens;
+     std::vector<completion_token_output> generated_token_probs;
+ 
++    llama_token start_token;
++    size_t start_pos;
++    bool have_start_token=false;
++
+     bool infill         = false;
+     bool embedding      = false;
+ 
+@@ -318,6 +322,31 @@
+         generated_token_probs.push_back(token);
+     }
+ 
++    void kv_remove(llama_context *ctx, int p0,
++		   const std::vector<llama_token> &system_tokens) {
++       if (!llama_kv_cache_seq_rm(ctx, id + 1, p0, -1)) {
++	  // could not partially delete (likely using a non-Transformer model)
++	  llama_kv_cache_seq_rm(ctx, id + 1, -1, -1);
++
++	  // cannot cache prompt
++	  params.cache_prompt = false;
++	  cache_tokens.clear();
++
++	  p0 = (int) system_tokens.size();
++	  if (p0 != 0) {
++	      // copy over the system prompt when there is one
++	      llama_kv_cache_seq_cp(ctx, 0, id + 1, -1, -1);
++	  }
++
++	  // there is no common part left (except for the system prompt)
++	  n_past = 0;
++	  n_past_se = 0;
++	  ga_i = 0;
++	  // TODO: is the system prompt ever in the sampling context?
++	  llama_sampling_reset(ctx_sampling);
++	  }
++       }
++
+     void release() {
+         if (state == SLOT_STATE_PROCESSING) {
+             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
+@@ -1779,6 +1808,7 @@
+ 
+         slot.command = SLOT_COMMAND_LOAD_PROMPT;
+         slot.prompt_tokens.clear();
++	slot.have_start_token=false;
+ 
+         LOG_INFO("slot is processing task", {
+             {"id_slot", slot.id},
+@@ -3096,10 +3126,6 @@
+             slot.n_past += 1;
+ 	       }
+ 
+-            if (slot.params.cache_prompt) {
+-                slot.cache_tokens.push_back(slot.sampled);
+-            }
+-
+             LOG_VERBOSE("slot decode token", {
+                 {"id_slot",         slot.id},
+                 {"id_task",         slot.id_task},
+@@ -3245,6 +3271,23 @@
+                             } else {
+                                 GGML_ASSERT(slot.ga_n == 1);
+ 
++				size_t n0=slot.cache_tokens.size(),n=n0,discard=0;
++
++				/* get rid of anything in kv longer than prompt */
++				if (n > prompt_tokens.size()) {
++				   discard=n-prompt_tokens.size();
++				   n = prompt_tokens.size();
++				   }
++
++				/* cache_tokens must be an even n_batch in length
++				   so results are the same with and without cache */
++				discard += n % n_batch;
++				if (discard) {
++				   int p0 = n0 - discard;
++				   slot.cache_tokens.resize(p0);
++				   slot.kv_remove(ctx,p0,system_tokens);
++				   }
++
+                                 // reuse any previously computed tokens that are common with the new prompt
+                                 slot.n_past = common_part(slot.cache_tokens, prompt_tokens);
+ 
+@@ -3280,24 +3323,9 @@
+ 
+                     // keep only the common part
+                     int p0 = (int) system_tokens.size() + slot.n_past;
+-                    if (!llama_kv_cache_seq_rm(ctx, slot.id + 1, p0, -1)) {
+-                        // could not partially delete (likely using a non-Transformer model)
+-                        llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
+-
+-                        p0 = (int) system_tokens.size();
+-                        if (p0 != 0) {
+-                            // copy over the system prompt when there is one
+-                            llama_kv_cache_seq_cp(ctx, 0, slot.id + 1, -1, -1);
+-                        }
+-
+-                        // there is no common part left (except for the system prompt)
+-                        slot.n_past = 0;
+-                        slot.n_past_se = 0;
+-                        slot.ga_i = 0;
+-                        // TODO: is the system prompt ever in the sampling context?
+-			llama_sampling_reset(slot.ctx_sampling);
+-                    }
++		    slot.kv_remove(ctx,p0,system_tokens);
+ 
++		    if (slot.params.cache_prompt)
+                     // remove the non-common part from the cache
+                     slot.cache_tokens.resize(slot.n_past);
+ 
+@@ -3358,11 +3386,24 @@
+ 
+                     // entire prompt has been processed - start decoding new tokens
+                     if (slot.n_past == slot.n_prompt_tokens) {
+-                        slot.state   = SLOT_STATE_PROCESSING;
+-                        slot.command = SLOT_COMMAND_NONE;
++			if (slot.have_start_token) {
++			   llama_batch_add(batch, slot.start_token, slot.start_pos, { slot.id + 1 }, true);
++			   slot.have_start_token=false;
++			   }
+ 
+                         GGML_ASSERT(batch.n_tokens > 0);
+ 
++			if (batch.n_tokens > 1) {
++			   slot.start_token = batch.token[batch.n_tokens-1];
++			   slot.start_pos = batch.pos[batch.n_tokens-1];
++			   slot.have_start_token=true;
++			   batch.n_tokens--;
++			   }
++			else {
++			   slot.state   = SLOT_STATE_PROCESSING;
++			   slot.command = SLOT_COMMAND_NONE;
++			   }
++
+                         // extract the logits only for the last token
+                         batch.logits[batch.n_tokens - 1] = true;
+ 
